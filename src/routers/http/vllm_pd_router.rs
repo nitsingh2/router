@@ -5,7 +5,7 @@ use super::logprobs_merge;
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
-use crate::config::KvConnector;
+use crate::config::{KvConnector, MoriIOMultiPodConfig};
 use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
@@ -64,6 +64,8 @@ pub struct VllmPDRouter {
     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
     /// NIXL push identity per prefill base_url and dp_rank; never held across an await.
     nixl_prefill_info: RwLock<HashMap<String, HashMap<usize, Value>>>,
+    /// None = single pod.
+    moriio_multi_pod: Option<MoriIOMultiPodConfig>,
 }
 
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
@@ -192,6 +194,21 @@ impl VllmPDRouter {
         }
     }
 
+    /// `remote_hosts` is the peer role's pods. The decode leg is marked leader because the
+    /// connector otherwise lets only pod-0 ranks originate the notify.
+    fn stamp_moriio_multi_pod(params: &mut Value, mp: &MoriIOMultiPodConfig, is_decode_leg: bool) {
+        let peer_hosts = if is_decode_leg {
+            &mp.prefill_hosts
+        } else {
+            &mp.decode_hosts
+        };
+        params["remote_hosts"] = json!(peer_hosts);
+        params["remote_dp_size_local"] = json!(mp.dp_size_local);
+        if is_decode_leg {
+            params["is_request_leader"] = json!(true);
+        }
+    }
+
     /// Build kv_transfer_params for the prefill request.
     ///
     /// Returns an error for MoRI-IO when no transfer mode has been registered yet, so that
@@ -235,6 +252,9 @@ impl VllmPDRouter {
                     });
                     if self.intra_node_data_parallel_size > 1 {
                         params["remote_dp_rank"] = json!(decode_dp_rank.unwrap_or(0));
+                    }
+                    if let Some(mp) = &self.moriio_multi_pod {
+                        Self::stamp_moriio_multi_pod(&mut params, mp, false);
                     }
                     Ok(params)
                 } else {
@@ -310,6 +330,9 @@ impl VllmPDRouter {
                         if let Some(rank) = prefill_dp_rank {
                             params["remote_dp_rank"] = json!(rank);
                         }
+                    }
+                    if let Some(mp) = &self.moriio_multi_pod {
+                        Self::stamp_moriio_multi_pod(&mut params, mp, true);
                     }
                     Some(params)
                 } else {
@@ -2033,6 +2056,7 @@ impl VllmPDRouter {
                 kv_connector,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
+                moriio_multi_pod: ctx.router_config.moriio_multi_pod.clone(),
             })
         } else {
             // Direct URL mode (same as PdRouterBase)
@@ -2128,6 +2152,7 @@ impl VllmPDRouter {
                 kv_connector,
                 mooncake_prefill_info,
                 nixl_prefill_info: RwLock::new(HashMap::new()),
+                moriio_multi_pod: ctx.router_config.moriio_multi_pod.clone(),
             })
         }
     }
@@ -3112,5 +3137,26 @@ mod tests {
     fn test_moriio_write_decode_params_includes_remote_dp_rank_when_dp_size_gt_1() {
         let params = moriio_write_decode_params(Some("tx-abc"), 4, Some(2));
         assert_eq!(params["remote_dp_rank"], 2);
+    }
+
+    #[test]
+    fn test_moriio_multi_pod_stamps_peer_hosts() {
+        let mp = MoriIOMultiPodConfig {
+            dp_size_local: 8,
+            prefill_hosts: vec!["10.0.0.1".into(), "10.0.0.2".into()],
+            decode_hosts: vec!["10.0.0.3".into(), "10.0.0.4".into()],
+        };
+
+        let mut prefill = moriio_write_prefill_params(Some("tx-abc"), 16, 1);
+        VllmPDRouter::stamp_moriio_multi_pod(&mut prefill, &mp, false);
+        assert_eq!(prefill["remote_hosts"], json!(["10.0.0.3", "10.0.0.4"]));
+        assert_eq!(prefill["remote_dp_size_local"], 8);
+        assert!(prefill.get("is_request_leader").is_none());
+
+        let mut decode = moriio_write_decode_params(Some("tx-abc"), 16, Some(9));
+        VllmPDRouter::stamp_moriio_multi_pod(&mut decode, &mp, true);
+        assert_eq!(decode["remote_hosts"], json!(["10.0.0.1", "10.0.0.2"]));
+        assert_eq!(decode["remote_dp_size_local"], 8);
+        assert_eq!(decode["is_request_leader"], true);
     }
 }

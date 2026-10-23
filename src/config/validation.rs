@@ -24,6 +24,7 @@ impl ConfigValidator {
             Self::validate_program_scheduling(program_scheduling)?;
         }
         Self::validate_epd(config)?;
+        Self::validate_moriio_multi_pod(config)?;
 
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
@@ -179,6 +180,40 @@ impl ConfigValidator {
                 reason: "force_resume_timeout_seconds must not exceed queue_timeout_seconds"
                     .to_string(),
             });
+        }
+        Ok(())
+    }
+
+    fn validate_moriio_multi_pod(config: &RouterConfig) -> ConfigResult<()> {
+        let Some(mp) = &config.moriio_multi_pod else {
+            return Ok(());
+        };
+        let invalid = |reason: String| ConfigError::ValidationFailed {
+            reason: format!("MoRI-IO multi-pod: {reason}"),
+        };
+        if config.kv_connector != KvConnector::MoriIO
+            || !matches!(config.mode, RoutingMode::VllmPrefillDecode { .. })
+        {
+            return Err(invalid(
+                "requires --vllm-pd-disaggregation with --kv-connector moriio".into(),
+            ));
+        }
+        if mp.dp_size_local == 0 || mp.prefill_hosts.is_empty() || mp.decode_hosts.is_empty() {
+            return Err(invalid(
+                "set all of --moriio-dp-size-local (>0), --moriio-prefill-hosts and \
+                 --moriio-decode-hosts"
+                    .into(),
+            ));
+        }
+        // Pinned ranks 0..dp_size must each land on a listed pod of both roles.
+        let dp_size = config.intra_node_data_parallel_size;
+        let pods = mp.prefill_hosts.len().min(mp.decode_hosts.len());
+        if dp_size <= 1 || dp_size > mp.dp_size_local * pods {
+            return Err(invalid(format!(
+                "--intra-node-data-parallel-size ({dp_size}) must be > 1 and <= \
+                 --moriio-dp-size-local ({}) x pods per role ({pods})",
+                mp.dp_size_local
+            )));
         }
         Ok(())
     }
@@ -1261,5 +1296,56 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    fn moriio_multi_pod_config(dp_size: usize, mp: MoriIOMultiPodConfig) -> RouterConfig {
+        RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: Some("0.0.0.0:36367".to_string()),
+            },
+            kv_connector: KvConnector::MoriIO,
+            intra_node_data_parallel_size: dp_size,
+            moriio_multi_pod: Some(mp),
+            ..Default::default()
+        }
+    }
+
+    fn two_pods() -> MoriIOMultiPodConfig {
+        MoriIOMultiPodConfig {
+            dp_size_local: 8,
+            prefill_hosts: vec!["10.0.0.1".into(), "10.0.0.2".into()],
+            decode_hosts: vec!["10.0.0.3".into(), "10.0.0.4".into()],
+        }
+    }
+
+    #[test]
+    fn test_validate_moriio_multi_pod() {
+        let ok = |dp, mp| {
+            ConfigValidator::validate_moriio_multi_pod(&moriio_multi_pod_config(dp, mp)).is_ok()
+        };
+        assert!(ok(16, two_pods()));
+        assert!(ConfigValidator::validate_moriio_multi_pod(&RouterConfig::default()).is_ok());
+
+        let mut config = moriio_multi_pod_config(16, two_pods());
+        config.kv_connector = KvConnector::Nixl;
+        assert!(ConfigValidator::validate_moriio_multi_pod(&config).is_err());
+
+        let mut mp = two_pods();
+        mp.dp_size_local = 0;
+        assert!(!ok(16, mp));
+        let mut mp = two_pods();
+        mp.decode_hosts.clear();
+        assert!(!ok(16, mp));
+        assert!(!ok(1, two_pods()));
+
+        // 1P2D: only 8 prefill ranks exist.
+        let mut mp = two_pods();
+        mp.prefill_hosts.truncate(1);
+        assert!(!ok(16, mp.clone()));
+        assert!(ok(8, mp));
     }
 }
